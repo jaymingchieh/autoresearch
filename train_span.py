@@ -43,6 +43,9 @@ def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--dataset", default="scierc",
                    choices=list(DATASET_REGISTRY.keys()))
+    p.add_argument("--data-dir", default=None,
+                   help="Override default dataset directory. Used by ACCORD-format "
+                        "datasets to point at zh-Hant silver CSVs etc.")
     p.add_argument("--model-name", default=None)
     p.add_argument("--batch-size", type=int, default=16)
     p.add_argument("--max-length", type=int, default=128)
@@ -983,6 +986,8 @@ def main():
         doc_dl_kwargs = dict(max_length=args.max_length)
         if "seed" in doc_dl_params:
             doc_dl_kwargs["seed"] = args.seed
+        if "data_dir" in doc_dl_params and args.data_dir:
+            doc_dl_kwargs["data_dir"] = args.data_dir
         train_loader, _, _ = ds_mod.build_doc_dataloaders(tokenizer, **doc_dl_kwargs)
         print(f"  doc-level train: {len(train_loader.dataset)} docs")
         # Sentence-level loaders for eval (same seed → same dev split)
@@ -990,6 +995,8 @@ def main():
         dl_params = inspect.signature(ds_mod.build_dataloaders).parameters
         if "seed" in dl_params:
             dl_kwargs["seed"] = args.seed
+        if "data_dir" in dl_params and args.data_dir:
+            dl_kwargs["data_dir"] = args.data_dir
         _, dev_loader, test_loader = ds_mod.build_dataloaders(tokenizer, **dl_kwargs)
         print(f"  sent-level eval: dev={len(dev_loader.dataset)} test={len(test_loader.dataset)}")
     else:
@@ -997,6 +1004,8 @@ def main():
         dl_params = inspect.signature(ds_mod.build_dataloaders).parameters
         if "seed" in dl_params:
             dl_kwargs["seed"] = args.seed
+        if "data_dir" in dl_params and args.data_dir:
+            dl_kwargs["data_dir"] = args.data_dir
         if "doc_window_size" in dl_params:
             dl_kwargs["doc_window_size"] = args.doc_window_size
         if "doc_window_stride" in dl_params:
