@@ -54,6 +54,16 @@ def parse_args():
     p.add_argument("--warmup-steps", type=int, default=250)
     p.add_argument("--max-span-width", type=int, default=8)
     p.add_argument("--re-weight", type=float, default=1.0)
+    p.add_argument("--re-warmup-steps", type=int, default=0,
+                   help="If >0, scale re_weight linearly from --re-warmup-factor "
+                        "to 1.0 over the first N steps. Mitigates the s47-style "
+                        "relation-head collapse seen in small-data zh-Hant runs "
+                        "where init bias × class imbalance pushes RE to "
+                        "always-NO_REL local minimum (blindspot 2026-06-03).")
+    p.add_argument("--re-warmup-factor", type=float, default=0.5,
+                   help="Starting scale for re_weight during warmup (default 0.5 = "
+                        "half RE loss weight at step 0, ramps to 1.0 at "
+                        "--re-warmup-steps).")
     p.add_argument("--neg-sample-ratio", type=float, default=0.5,
                    help="Ratio of negative spans to positive spans for NER training. "
                         "0.5 = half as many negatives as positives.")
@@ -1206,6 +1216,18 @@ def main():
         else:
             boost_eff = args.re_comparison_boost
 
+        # B-TW.8: Effective RE weight with optional warmup ramp.
+        # When --re-warmup-steps > 0, scale args.re_weight by a factor that ramps
+        # linearly from --re-warmup-factor at step 0 to 1.0 at step N. This lets
+        # NER head establish span boundaries before the RE head's class-imbalanced
+        # gradient signal can dominate and push to always-NO_REL.
+        if args.re_warmup_steps > 0 and step < args.re_warmup_steps:
+            ramp = step / max(args.re_warmup_steps, 1)
+            warmup_scale = args.re_warmup_factor + (1.0 - args.re_warmup_factor) * ramp
+        else:
+            warmup_scale = 1.0
+        re_weight_eff = args.re_weight * warmup_scale
+
         # A16: Seed-adaptive boost — override boost_eff if threshold was crossed
         if use_boost_adaptive and boost_adaptive_switched:
             boost_eff = low_boost  # already evaluated and switched
@@ -1259,7 +1281,7 @@ def main():
             doc_batch = batch  # batch = list of sentence dicts from collate_doc
             gold_loss, ner_loss, re_loss = compute_doc_loss(
                 model, doc_batch, device, ds_mod, entity_type2id,
-                re_weight=args.re_weight,
+                re_weight=re_weight_eff,
                 neg_sample_ratio=args.neg_sample_ratio,
                 max_span_width=args.max_span_width,
                 re_comparison_boost=boost_eff,
@@ -1315,7 +1337,7 @@ def main():
             # R-Drop: two forward passes with different dropout, KL on BIO logits
             gold_loss, ner_loss, re_loss, cl_loss, bio_l, bio_logits1 = compute_span_loss(
                 model, batch, device, ds_mod, entity_type2id,
-                re_weight=args.re_weight, neg_sample_ratio=args.neg_sample_ratio,
+                re_weight=re_weight_eff, neg_sample_ratio=args.neg_sample_ratio,
                 max_span_width=args.max_span_width, focal_gamma=args.focal_gamma,
                 cl_weight=args.cl_weight, cl_tau=args.cl_tau,
                 cl_entity_only=args.cl_entity_only,
@@ -1336,7 +1358,7 @@ def main():
             )
             gold_loss2, _, _, _, _, bio_logits2 = compute_span_loss(
                 model, batch, device, ds_mod, entity_type2id,
-                re_weight=args.re_weight, neg_sample_ratio=args.neg_sample_ratio,
+                re_weight=re_weight_eff, neg_sample_ratio=args.neg_sample_ratio,
                 max_span_width=args.max_span_width, focal_gamma=args.focal_gamma,
                 cl_weight=args.cl_weight, cl_tau=args.cl_tau,
                 cl_entity_only=args.cl_entity_only,
@@ -1368,7 +1390,7 @@ def main():
         else:
             gold_loss, ner_loss, re_loss, cl_loss, bio_l = compute_span_loss(
                 model, batch, device, ds_mod, entity_type2id,
-                re_weight=args.re_weight, neg_sample_ratio=args.neg_sample_ratio,
+                re_weight=re_weight_eff, neg_sample_ratio=args.neg_sample_ratio,
                 max_span_width=args.max_span_width, focal_gamma=args.focal_gamma,
                 cl_weight=args.cl_weight, cl_tau=args.cl_tau,
                 cl_entity_only=args.cl_entity_only,
