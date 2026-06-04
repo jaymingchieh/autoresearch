@@ -64,6 +64,13 @@ def parse_args():
                    help="Starting scale for re_weight during warmup (default 0.5 = "
                         "half RE loss weight at step 0, ramps to 1.0 at "
                         "--re-warmup-steps).")
+    p.add_argument("--re-no-rel-weight", type=float, default=1.0,
+                   help="Class weight for NO_REL in the RE cross-entropy. "
+                        "Setting below 1.0 downweights the dominant NO_REL class "
+                        "(B-TW.9 collapse mitigation 2026-06-04). Stacks with "
+                        "--re-comparison-boost: NO_REL = re_no_rel_weight, "
+                        "comparison relations = re_comparison_boost, others = 1.0. "
+                        "Default 1.0 = no change.")
     p.add_argument("--neg-sample-ratio", type=float, default=0.5,
                    help="Ratio of negative spans to positive spans for NER training. "
                         "0.5 = half as many negatives as positives.")
@@ -368,7 +375,8 @@ def _build_span_labels(gold_entities, num_words, max_span_width, entity_type2id)
 
 def compute_doc_loss(model, doc_batch, device, ds_mod, entity_type2id,
                      re_weight=1.0, neg_sample_ratio=0.5, max_span_width=8,
-                     re_comparison_boost=1.0, bio_weight=0.0):
+                     re_comparison_boost=1.0, re_no_rel_weight=1.0,
+                     bio_weight=0.0):
     """
     Phase B3: Document-level loss with Evidence GAT.
 
@@ -514,12 +522,18 @@ def compute_doc_loss(model, doc_batch, device, ds_mod, entity_type2id,
         targets_t = torch.tensor(targets, device=device, dtype=torch.long)
 
         # Class weighting for rare comparison relations (A11-compatible)
+        # and optional NO_REL downweighting (B-TW.9 collapse mitigation,
+        # see compute_span_loss for rationale).
         re_class_w = None
-        if re_comparison_boost > 1.0 and comparison_rel_ids:
+        needs_weighting = (re_comparison_boost > 1.0 and comparison_rel_ids) or re_no_rel_weight != 1.0
+        if needs_weighting:
             re_class_w = re_logits.new_ones(re_logits.size(-1))
-            for cid in comparison_rel_ids:
-                if cid < re_class_w.size(0):
-                    re_class_w[cid] = re_comparison_boost
+            if re_no_rel_weight != 1.0:
+                re_class_w[no_rel_id] = re_no_rel_weight
+            if re_comparison_boost > 1.0:
+                for cid in comparison_rel_ids:
+                    if cid < re_class_w.size(0):
+                        re_class_w[cid] = re_comparison_boost
 
         re_losses.append(F.cross_entropy(re_logits, targets_t, weight=re_class_w))
 
@@ -544,6 +558,7 @@ def compute_span_loss(model, batch, device, ds_mod, entity_type2id,
                       re_neg_subsample=0.0,
                       re_adv_neg=False, re_adv_temp=0.5,
                       re_comparison_boost=1.0,
+                      re_no_rel_weight=1.0,
                       global_rel_weight=0.0):
     """Compute span NER loss + RE loss + optional BIO auxiliary loss."""
     input_ids = batch["input_ids"].to(device)
@@ -756,11 +771,18 @@ def compute_span_loss(model, batch, device, ds_mod, entity_type2id,
                 pair_targets_t = torch.tensor(pair_targets, device=device, dtype=torch.long)
                 re_logits = model.forward_re(hidden[b_idx], word_ids_list[b_idx], pairs)
                 # Build class weight tensor for comparison relation boost (A11)
+                # and optional NO_REL downweighting (B-TW.9 collapse mitigation:
+                # 06-04 RE warmup failed because class imbalance, not gradient
+                # magnitude, drove s47 collapse. Downweighting NO_REL directly
+                # rebalances the cross-entropy without delaying RE training).
                 re_class_w = None
-                if re_comparison_boost > 1.0:
-                    comparison_ids = getattr(ds_mod, 'COMPARISON_REL_IDS', [])
-                    if comparison_ids:
-                        re_class_w = re_logits.new_ones(re_logits.size(-1))
+                comparison_ids = getattr(ds_mod, 'COMPARISON_REL_IDS', [])
+                needs_weighting = (re_comparison_boost > 1.0 and comparison_ids) or re_no_rel_weight != 1.0
+                if needs_weighting:
+                    re_class_w = re_logits.new_ones(re_logits.size(-1))
+                    if re_no_rel_weight != 1.0:
+                        re_class_w[NO_REL] = re_no_rel_weight
+                    if re_comparison_boost > 1.0:
                         for cid in comparison_ids:
                             if cid < re_class_w.size(0):
                                 re_class_w[cid] = re_comparison_boost
@@ -1285,6 +1307,7 @@ def main():
                 neg_sample_ratio=args.neg_sample_ratio,
                 max_span_width=args.max_span_width,
                 re_comparison_boost=boost_eff,
+                re_no_rel_weight=args.re_no_rel_weight,
                 bio_weight=bio_w_eff,
             )
             cl_loss = gold_loss.new_tensor(0.0)
@@ -1354,6 +1377,7 @@ def main():
                 re_adv_neg=args.re_adv_neg,
                 re_adv_temp=args.re_adv_temp,
                 re_comparison_boost=boost_eff,
+                re_no_rel_weight=args.re_no_rel_weight,
                 global_rel_weight=args.global_rel_weight,
             )
             gold_loss2, _, _, _, _, bio_logits2 = compute_span_loss(
@@ -1375,6 +1399,7 @@ def main():
                 re_adv_neg=args.re_adv_neg,
                 re_adv_temp=args.re_adv_temp,
                 re_comparison_boost=boost_eff,
+                re_no_rel_weight=args.re_no_rel_weight,
                 global_rel_weight=args.global_rel_weight,
             )
             # Average the two losses + symmetric KL on BIO logits
@@ -1407,6 +1432,7 @@ def main():
                 re_adv_neg=args.re_adv_neg,
                 re_adv_temp=args.re_adv_temp,
                 re_comparison_boost=boost_eff,
+                re_no_rel_weight=args.re_no_rel_weight,
                 global_rel_weight=args.global_rel_weight,
             )
 
