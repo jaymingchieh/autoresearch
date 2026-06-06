@@ -787,9 +787,13 @@ def compute_span_loss(model, batch, device, ds_mod, entity_type2id,
                             if cid < re_class_w.size(0):
                                 re_class_w[cid] = re_comparison_boost
                 if re_focal_gamma > 0:
+                    # focal_loss expects per-sample weights; re_class_w is
+                    # per-class. Gather per target to convert.
+                    sample_w = (re_class_w[pair_targets_t]
+                                if re_class_w is not None else None)
                     re_losses.append(focal_loss(re_logits, pair_targets_t,
                                                 gamma=re_focal_gamma,
-                                                weights=re_class_w))
+                                                weights=sample_w))
                 else:
                     re_losses.append(F.cross_entropy(re_logits, pair_targets_t,
                                                      weight=re_class_w))
