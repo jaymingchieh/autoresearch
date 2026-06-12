@@ -46,6 +46,7 @@ Phase B3 (ECRG-style evidence graph):
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint
 from transformers import AutoModel
 
 from data.scierc import NUM_BIO_TAGS, NUM_RELATIONS, NO_REL_ID, BIO_TAG2ID, ID2BIO
@@ -687,7 +688,7 @@ class BertKGExtractor(nn.Module):
         return new_words, head_open, tail_open
 
     def forward_re_markers(self, words_b, pairs, head_types, tail_types,
-                           tokenizer, device, max_length=256):
+                           tokenizer, device, max_length=256, chunk=16):
         """Typed-entity-marker RE (B-TW.12): re-encode the sentence once per pair
         with markers inserted, read the head/tail open-marker hidden states, and
         classify with a dedicated 2H re_marker_head.
@@ -696,6 +697,13 @@ class BertKGExtractor(nn.Module):
         pairs:       list of ((hs,he),(ts,te)) word-inclusive spans
         head_types/tail_types: per-pair entity-type strings for the markers
         Returns: (num_pairs, NUM_RELATIONS)
+
+        Memory: a sentence can yield O(spans^2) pairs, each its own marked
+        re-encode. Encoding all at once exhausts the GB10 unified memory
+        (OOM-killer → silent SIGKILL). We process pairs in `chunk`-sized
+        mini-batches and, during training, gradient-checkpoint each chunk's
+        encode so peak memory is bounded to one chunk regardless of pair count.
+        All pairs are still used (the experiment vs I is unchanged).
         """
         if not pairs:
             return self.re_marker_head[-1].weight.new_zeros((0, NUM_RELATIONS))
@@ -708,19 +716,29 @@ class BertKGExtractor(nn.Module):
         enc = tokenizer(marked, is_split_into_words=True, padding=True,
                         truncation=True, max_length=max_length,
                         return_tensors="pt")
-        input_ids = enc["input_ids"].to(device)
-        attention_mask = enc["attention_mask"].to(device)
-        hidden = self.encode(modality="text", input_ids=input_ids,
-                             attention_mask=attention_mask)  # (P, T, H)
-        head_vecs, tail_vecs = [], []
-        for i in range(len(marked)):
-            wids = enc.word_ids(i)
-            h_tok = self._first_token_for_word_safe(wids, head_open_idxs[i])
-            t_tok = self._first_token_for_word_safe(wids, tail_open_idxs[i])
-            head_vecs.append(hidden[i, h_tok])
-            tail_vecs.append(hidden[i, t_tok])
-        feats = torch.cat([torch.stack(head_vecs, 0),
-                           torch.stack(tail_vecs, 0)], dim=-1)  # (P, 2H)
+        P = len(marked)
+        use_ckpt = self.training
+        feats_list = []
+        for start in range(0, P, chunk):
+            end = min(start + chunk, P)
+            ii = enc["input_ids"][start:end].to(device)
+            am = enc["attention_mask"][start:end].to(device)
+            if use_ckpt:
+                hidden = torch.utils.checkpoint.checkpoint(
+                    lambda a, b: self.encode(modality="text", input_ids=a,
+                                             attention_mask=b),
+                    ii, am, use_reentrant=False)  # (chunk, T, H)
+            else:
+                hidden = self.encode(modality="text", input_ids=ii,
+                                     attention_mask=am)
+            for j in range(end - start):
+                i = start + j
+                wids = enc.word_ids(i)
+                h_tok = self._first_token_for_word_safe(wids, head_open_idxs[i])
+                t_tok = self._first_token_for_word_safe(wids, tail_open_idxs[i])
+                feats_list.append(torch.cat([hidden[j, h_tok], hidden[j, t_tok]],
+                                            dim=-1))
+        feats = torch.stack(feats_list, dim=0)  # (P, 2H)
         return self.re_marker_head(self.dropout(feats))
 
     @staticmethod
