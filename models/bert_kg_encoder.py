@@ -319,6 +319,13 @@ class BertKGExtractor(nn.Module):
         self._re_n_rel = n_rel
         self._dropout_p = dropout
 
+        # ── B-TW.12 typed-entity-marker RE head (set in train_span.py) ────
+        # When --re-marker-mode typed-punct, the pair representation is the
+        # concat of the head/tail open-marker hidden states (2H) instead of the
+        # pooled span concat. re_marker_head classifies that 2H vector.
+        self.re_marker_mode = False
+        self.re_marker_head = None
+
         # ── GREP-style global relation prediction head (A13) ─────────────
         # Predicts which relation types are present in the document as a
         # multi-label auxiliary task over the [CLS] token representation.
@@ -651,6 +658,79 @@ class BertKGExtractor(nn.Module):
         if return_feats:
             return logits, feats
         return logits
+
+    @staticmethod
+    def _build_marked_words(words, head_span, tail_span, head_type, tail_type):
+        """Insert typed punct markers around head/tail spans (B-TW.12 PURE-style).
+
+        head: `@ <head_type> ...head words... @`   (open marker token = "@")
+        tail: `# <tail_type> ...tail words... #`   (open marker token = "#")
+        Returns (marked_words, head_open_word_idx, tail_open_word_idx). Markers are
+        separate "words" so is_split_into_words tokenization keeps them atomic (no
+        zh subword merge with entity text, no new special-token cold-start).
+        """
+        (hs, he), (ts, te) = head_span, tail_span
+        new_words, head_open, tail_open = [], -1, -1
+        for p in range(len(words) + 1):
+            if p == hs:
+                head_open = len(new_words)
+                new_words += ["@", head_type]
+            if p == ts:
+                tail_open = len(new_words)
+                new_words += ["#", tail_type]
+            if p == he + 1:
+                new_words.append("@")
+            if p == te + 1:
+                new_words.append("#")
+            if p < len(words):
+                new_words.append(words[p])
+        return new_words, head_open, tail_open
+
+    def forward_re_markers(self, words_b, pairs, head_types, tail_types,
+                           tokenizer, device, max_length=256):
+        """Typed-entity-marker RE (B-TW.12): re-encode the sentence once per pair
+        with markers inserted, read the head/tail open-marker hidden states, and
+        classify with a dedicated 2H re_marker_head.
+
+        words_b:     list[str] original words for ONE example
+        pairs:       list of ((hs,he),(ts,te)) word-inclusive spans
+        head_types/tail_types: per-pair entity-type strings for the markers
+        Returns: (num_pairs, NUM_RELATIONS)
+        """
+        if not pairs:
+            return self.re_marker_head[-1].weight.new_zeros((0, NUM_RELATIONS))
+        marked, head_open_idxs, tail_open_idxs = [], [], []
+        for (hspan, tspan), th, tt in zip(pairs, head_types, tail_types):
+            mw, ho, to = self._build_marked_words(words_b, hspan, tspan, th, tt)
+            marked.append(mw)
+            head_open_idxs.append(ho)
+            tail_open_idxs.append(to)
+        enc = tokenizer(marked, is_split_into_words=True, padding=True,
+                        truncation=True, max_length=max_length,
+                        return_tensors="pt")
+        input_ids = enc["input_ids"].to(device)
+        attention_mask = enc["attention_mask"].to(device)
+        hidden = self.encode(modality="text", input_ids=input_ids,
+                             attention_mask=attention_mask)  # (P, T, H)
+        head_vecs, tail_vecs = [], []
+        for i in range(len(marked)):
+            wids = enc.word_ids(i)
+            h_tok = self._first_token_for_word_safe(wids, head_open_idxs[i])
+            t_tok = self._first_token_for_word_safe(wids, tail_open_idxs[i])
+            head_vecs.append(hidden[i, h_tok])
+            tail_vecs.append(hidden[i, t_tok])
+        feats = torch.cat([torch.stack(head_vecs, 0),
+                           torch.stack(tail_vecs, 0)], dim=-1)  # (P, 2H)
+        return self.re_marker_head(self.dropout(feats))
+
+    @staticmethod
+    def _first_token_for_word_safe(word_ids_b, word_idx):
+        """First token index mapped to word_idx; falls back to CLS (0) if the
+        marker was truncated out of the sequence."""
+        for i, wid in enumerate(word_ids_b):
+            if wid == word_idx:
+                return i
+        return 0
 
     def forward_re_with_graph(
         self,

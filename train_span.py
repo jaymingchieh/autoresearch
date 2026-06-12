@@ -151,6 +151,15 @@ def parse_args():
     p.add_argument("--re-pcl-debug", action="store_true",
                    help="Print PCL diagnostics (non-NO_REL anchor count, mean |P(i)|, "
                         "pcl_loss) each step. For smoke tests only — noisy.")
+    p.add_argument("--re-marker-mode", choices=["off", "typed-punct"], default="off",
+                   help="B-TW.12: RE pair representation. 'off' (default) = pooled "
+                        "span concat [head;tail;between] (current). 'typed-punct' = "
+                        "PURE-style typed entity markers — re-encode the sentence per "
+                        "pair with `@ <type> head @` / `# <type> tail #` markers and "
+                        "classify from the head/tail open-marker hidden states (2H) "
+                        "via a dedicated re_marker_head. Early type+pair fusion; "
+                        "stronger in low-data RE. Single-variable: keep loss machinery "
+                        "unchanged. punct markers avoid new-special-token cold-start.")
     p.add_argument("--re-train-conf", type=float, default=0.5,
                    help="Confidence threshold for predicted spans used in RE training. "
                         "Lower = more candidate pairs (noisier but more diverse). "
@@ -578,7 +587,9 @@ def compute_span_loss(model, batch, device, ds_mod, entity_type2id,
                       global_rel_weight=0.0,
                       re_pair_contrastive_weight=0.0,
                       re_pair_contrastive_temp=0.07,
-                      re_pcl_debug=False):
+                      re_pcl_debug=False,
+                      tokenizer=None, id2entity_type=None,
+                      marker_max_length=256):
     """Compute span NER loss + RE loss + optional BIO auxiliary loss."""
     input_ids = batch["input_ids"].to(device)
     attention_mask = batch["attention_mask"].to(device)
@@ -586,6 +597,7 @@ def compute_span_loss(model, batch, device, ds_mod, entity_type2id,
     gold_entities_list = batch["gold_entities"]
     gold_relations_list = batch["gold_relations"]
     num_words_list = batch["num_words"]
+    words_list = batch.get("words", None)
 
     hidden = model.encode(modality="text", input_ids=input_ids, attention_mask=attention_mask)
 
@@ -793,7 +805,22 @@ def compute_span_loss(model, batch, device, ds_mod, entity_type2id,
                         pair_targets = [pair_targets[i] for i in keep_idx]
 
                 pair_targets_t = torch.tensor(pair_targets, device=device, dtype=torch.long)
-                if use_pcl:
+                if model.re_marker_mode:
+                    # B-TW.12: build per-span type strings (gold type if known,
+                    # else NER-predicted type) for the typed markers.
+                    gtype = {(s, e): t for (s, e, t) in gold_ents}
+                    span2type = {}
+                    cand_type = {(s, e): id2entity_type.get(tid, "Entity")
+                                 for (s, e), tid in zip(candidates, pred_types_re)
+                                 if tid > 0}
+                    for sp in re_spans:
+                        span2type[sp] = gtype.get(sp) or cand_type.get(sp, "Entity")
+                    head_types = [span2type[h] for (h, t) in pairs]
+                    tail_types = [span2type[t] for (h, t) in pairs]
+                    re_logits = model.forward_re_markers(
+                        words_list[b_idx], pairs, head_types, tail_types,
+                        tokenizer, device, marker_max_length)
+                elif use_pcl:
                     re_logits, re_pair_feats = model.forward_re(
                         hidden[b_idx], word_ids_list[b_idx], pairs, return_feats=True)
                     batch_pcl_vecs.append(F.normalize(re_pair_feats, p=2, dim=-1))
@@ -885,7 +912,8 @@ def compute_span_loss(model, batch, device, ds_mod, entity_type2id,
 
 def evaluate_span(model, dataloader, device, ds_mod, entity_type2id, id2entity_type,
                   max_span_width=8, span_threshold=0.5, verbose=False,
-                  span_proposal=False, span_proposal_expand=1):
+                  span_proposal=False, span_proposal_expand=1,
+                  tokenizer=None, marker_max_length=256):
     """Evaluate with span-based NER predictions feeding into RE."""
     from eval.triple_f1 import _prf
     model.eval()
@@ -909,6 +937,7 @@ def evaluate_span(model, dataloader, device, ds_mod, entity_type2id, id2entity_t
             gold_entities_list = batch["gold_entities"]
             gold_relations_list = batch["gold_relations"]
             num_words_list = batch["num_words"]
+            words_list = batch.get("words", None)
 
             hidden = model.encode(modality="text", input_ids=input_ids, attention_mask=attention_mask)
 
@@ -1002,7 +1031,15 @@ def evaluate_span(model, dataloader, device, ds_mod, entity_type2id, id2entity_t
                 pred_pairs = [(a, b) for a in pred_span_list for b in pred_span_list if a != b]
                 total_re_pairs += len(pred_pairs)
                 if pred_pairs:
-                    pred_re_logits = model.forward_re(hidden[b_idx], word_ids_list[b_idx], pred_pairs)
+                    if model.re_marker_mode:
+                        p2t = {(s, e): t for (s, e, t) in pred_spans}
+                        h_types = [p2t[a] for (a, b) in pred_pairs]
+                        t_types = [p2t[b] for (a, b) in pred_pairs]
+                        pred_re_logits = model.forward_re_markers(
+                            words_list[b_idx], pred_pairs, h_types, t_types,
+                            tokenizer, device, marker_max_length)
+                    else:
+                        pred_re_logits = model.forward_re(hidden[b_idx], word_ids_list[b_idx], pred_pairs)
                     pred_re_ids = pred_re_logits.argmax(dim=-1).tolist()
                     pred_full = {(h, t, p) for (h, t), p in zip(pred_pairs, pred_re_ids) if p != NO_REL}
                 else:
@@ -1145,6 +1182,19 @@ def main():
             torch.nn.Linear(hidden, n_rel),
         ).to(device)
         print(f"  re_context_span: enabled (RE head input: 3H={hidden*3})")
+
+    # B-TW.12: typed-entity-marker RE head (2H from head/tail open-marker vecs).
+    if args.re_marker_mode == "typed-punct":
+        model.re_marker_mode = True
+        hidden = model.backbone.hidden_size
+        n_rel = ds_mod.NUM_RELATIONS
+        model.re_marker_head = torch.nn.Sequential(
+            torch.nn.Linear(hidden * 2, hidden),
+            torch.nn.GELU(),
+            torch.nn.Dropout(0.1),
+            torch.nn.Linear(hidden, n_rel),
+        ).to(device)
+        print(f"  re_marker_mode: typed-punct (RE head input: 2H={hidden*2})")
 
     # A13: GREP-style global relation prediction head.
     if args.global_rel_weight > 0:
@@ -1322,6 +1372,7 @@ def main():
                     model, dev_loader, device, ds_mod,
                     entity_type2id=entity_type2id, id2entity_type=id2entity_type,
                     max_span_width=args.max_span_width,
+                    tokenizer=tokenizer, marker_max_length=args.max_length,
                 )
             if _saved_train:
                 model.train()
@@ -1394,6 +1445,7 @@ def main():
                     entity_type2id=entity_type2id,
                     id2entity_type=id2entity_type,
                     max_span_width=args.max_span_width,
+                    tokenizer=tokenizer, marker_max_length=args.max_length,
                 )
                 model.evidence_gat = saved_gat
                 triple_f1 = eval_metrics.get("triple_f1", 0.0)
@@ -1439,6 +1491,8 @@ def main():
                 re_pair_contrastive_weight=args.re_pair_contrastive_weight,
                 re_pair_contrastive_temp=args.re_pair_contrastive_temp,
                 re_pcl_debug=args.re_pcl_debug,
+                tokenizer=tokenizer, id2entity_type=id2entity_type,
+                marker_max_length=args.max_length,
             )
             gold_loss2, _, _, _, _, bio_logits2 = compute_span_loss(
                 model, batch, device, ds_mod, entity_type2id,
@@ -1464,6 +1518,8 @@ def main():
                 re_pair_contrastive_weight=args.re_pair_contrastive_weight,
                 re_pair_contrastive_temp=args.re_pair_contrastive_temp,
                 re_pcl_debug=args.re_pcl_debug,
+                tokenizer=tokenizer, id2entity_type=id2entity_type,
+                marker_max_length=args.max_length,
             )
             # Average the two losses + symmetric KL on BIO logits
             gold_loss = (gold_loss + gold_loss2) / 2
@@ -1500,6 +1556,8 @@ def main():
                 re_pair_contrastive_weight=args.re_pair_contrastive_weight,
                 re_pair_contrastive_temp=args.re_pair_contrastive_temp,
                 re_pcl_debug=args.re_pcl_debug,
+                tokenizer=tokenizer, id2entity_type=id2entity_type,
+                marker_max_length=args.max_length,
             )
 
         synth_loss_val = 0.0
@@ -1555,6 +1613,7 @@ def main():
                 verbose=True,
                 span_proposal=args.span_proposal,
                 span_proposal_expand=args.span_proposal_expand,
+                tokenizer=tokenizer, marker_max_length=args.max_length,
             )
             star = ""
             if metrics.get(args.primary_metric, 0.0) > best_metrics[args.primary_metric]:
@@ -1583,6 +1642,7 @@ def main():
             max_span_width=args.max_span_width,
             span_proposal=args.span_proposal,
             span_proposal_expand=args.span_proposal_expand,
+            tokenizer=tokenizer, marker_max_length=args.max_length,
         )
         if split_name == "dev" and metrics.get(args.primary_metric, 0.0) > best_metrics[args.primary_metric]:
             best_metrics = dict(metrics)
