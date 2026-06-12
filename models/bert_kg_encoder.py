@@ -615,7 +615,8 @@ class BertKGExtractor(nn.Module):
             return hidden_states_b.new_zeros(hidden_states_b.size(-1))
         return hidden_states_b[token_idx].mean(dim=0)
 
-    def forward_re(self, hidden_states_b: torch.Tensor, word_ids_b: list, pairs: list) -> torch.Tensor:
+    def forward_re(self, hidden_states_b: torch.Tensor, word_ids_b: list, pairs: list,
+                   return_feats: bool = False) -> torch.Tensor:
         """
         For one example in the batch:
             hidden_states_b: (T, H)
@@ -625,9 +626,16 @@ class BertKGExtractor(nn.Module):
 
         If self.re_context_span is True, the pair representation is 3H:
         [head_vec; tail_vec; between_span_mean] instead of 2H [head_vec; tail_vec].
+
+        If return_feats is True, also returns the pre-logits pair representation
+        (num_pairs, 2H or 3H) for pair-level contrastive loss (B-TW.11 PCL).
         """
+        in_dim = hidden_states_b.size(-1) * (3 if self.re_context_span else 2)
         if not pairs:
-            return hidden_states_b.new_zeros((0, NUM_RELATIONS))
+            empty_logits = hidden_states_b.new_zeros((0, NUM_RELATIONS))
+            if return_feats:
+                return empty_logits, hidden_states_b.new_zeros((0, in_dim))
+            return empty_logits
         feats = []
         for (hs, he), (ts, te) in pairs:
             head_vec = self.span_repr(hidden_states_b, word_ids_b, (hs, he))
@@ -639,7 +647,10 @@ class BertKGExtractor(nn.Module):
             else:
                 feats.append(torch.cat([head_vec, tail_vec], dim=-1))
         feats = torch.stack(feats, dim=0)  # (num_pairs, 2H or 3H)
-        return self.re_head(self.dropout(feats))
+        logits = self.re_head(self.dropout(feats))
+        if return_feats:
+            return logits, feats
+        return logits
 
     def forward_re_with_graph(
         self,

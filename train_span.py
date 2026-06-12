@@ -135,6 +135,22 @@ def parse_args():
                    help="Focal loss gamma for RE head. 0 = standard CE (default). "
                         "RE pairs are ~93%% NO_REL — focal loss downweights easy "
                         "negatives so the model focuses on hard relation cases.")
+    p.add_argument("--re-pair-contrastive-weight", type=float, default=0.0,
+                   help="B-TW.11 PCL: weight for pair-level supervised contrastive "
+                        "(SupCon) auxiliary loss on the RE pair representation. "
+                        "0 = disabled (default). Pulls same-relation pairs together "
+                        "and pushes different-relation pairs apart in the pre-logits "
+                        "feature space. NO_REL (id 0) pairs are EXCLUDED as anchors "
+                        "(entity_only semantics) so PCL shapes only the real-relation "
+                        "manifold — an architecture axis orthogonal to the classwgt "
+                        "CE axis (avoids the focal*classwgt same-axis conflict, "
+                        "blindspot 2026-06-07). Recommended start: 0.1.")
+    p.add_argument("--re-pair-contrastive-temp", type=float, default=0.07,
+                   help="Temperature tau for the PCL SupCon loss. Default 0.07 "
+                        "(SupCon, Khosla 2020). Lower = sharper.")
+    p.add_argument("--re-pcl-debug", action="store_true",
+                   help="Print PCL diagnostics (non-NO_REL anchor count, mean |P(i)|, "
+                        "pcl_loss) each step. For smoke tests only — noisy.")
     p.add_argument("--re-train-conf", type=float, default=0.5,
                    help="Confidence threshold for predicted spans used in RE training. "
                         "Lower = more candidate pairs (noisier but more diverse). "
@@ -559,7 +575,10 @@ def compute_span_loss(model, batch, device, ds_mod, entity_type2id,
                       re_adv_neg=False, re_adv_temp=0.5,
                       re_comparison_boost=1.0,
                       re_no_rel_weight=1.0,
-                      global_rel_weight=0.0):
+                      global_rel_weight=0.0,
+                      re_pair_contrastive_weight=0.0,
+                      re_pair_contrastive_temp=0.07,
+                      re_pcl_debug=False):
     """Compute span NER loss + RE loss + optional BIO auxiliary loss."""
     input_ids = batch["input_ids"].to(device)
     attention_mask = batch["attention_mask"].to(device)
@@ -592,6 +611,11 @@ def compute_span_loss(model, batch, device, ds_mod, entity_type2id,
     # Accumulate span vecs/labels across batch for batch-level contrastive
     batch_cl_vecs = []
     batch_cl_labels = []
+    # B-TW.11 PCL: accumulate pair (pre-logits) vecs/labels for batch-level
+    # pair-level supervised contrastive loss.
+    use_pcl = re_pair_contrastive_weight > 0
+    batch_pcl_vecs = []
+    batch_pcl_labels = []
 
     for b_idx in range(input_ids.size(0)):
         n_words = num_words_list[b_idx]
@@ -769,7 +793,13 @@ def compute_span_loss(model, batch, device, ds_mod, entity_type2id,
                         pair_targets = [pair_targets[i] for i in keep_idx]
 
                 pair_targets_t = torch.tensor(pair_targets, device=device, dtype=torch.long)
-                re_logits = model.forward_re(hidden[b_idx], word_ids_list[b_idx], pairs)
+                if use_pcl:
+                    re_logits, re_pair_feats = model.forward_re(
+                        hidden[b_idx], word_ids_list[b_idx], pairs, return_feats=True)
+                    batch_pcl_vecs.append(F.normalize(re_pair_feats, p=2, dim=-1))
+                    batch_pcl_labels.append(pair_targets_t)
+                else:
+                    re_logits = model.forward_re(hidden[b_idx], word_ids_list[b_idx], pairs)
                 # Build class weight tensor for comparison relation boost (A11)
                 # and optional NO_REL downweighting (B-TW.9 collapse mitigation:
                 # 06-04 RE warmup failed because class imbalance, not gradient
@@ -809,6 +839,29 @@ def compute_span_loss(model, batch, device, ds_mod, entity_type2id,
         )
     else:
         contrastive_loss = hidden.new_tensor(0.0)
+    # B-TW.11 PCL: pair-level supervised contrastive loss. entity_only=True masks
+    # labels > 0, i.e. excludes NO_REL (id 0) anchors — PCL shapes only the
+    # real-relation manifold (architecture axis, orthogonal to classwgt CE).
+    if use_pcl and batch_pcl_vecs:
+        all_pcl_vecs = torch.cat(batch_pcl_vecs, dim=0)
+        all_pcl_labels = torch.cat(batch_pcl_labels, dim=0)
+        pcl_loss = supervised_contrastive_loss(
+            all_pcl_vecs, all_pcl_labels,
+            tau=re_pair_contrastive_temp, entity_only=True,
+        )
+        if re_pcl_debug:
+            with torch.no_grad():
+                lab = all_pcl_labels[all_pcl_labels > 0]
+                if lab.numel() >= 2:
+                    pm = (lab.unsqueeze(0) == lab.unsqueeze(1)).float()
+                    pm.fill_diagonal_(0)
+                    print(f"[PCL] anchors(non-NO_REL)={lab.numel()} "
+                          f"mean|P(i)|={pm.sum(dim=1).mean().item():.2f} "
+                          f"pcl_loss={pcl_loss.item():.4f}")
+                else:
+                    print(f"[PCL] anchors(non-NO_REL)={lab.numel()} (too few, skipped)")
+    else:
+        pcl_loss = hidden.new_tensor(0.0)
     # A13 GREP-style global relation prediction: multi-label BCE over [CLS] token.
     # Predicts which relation types are present in the batch.
     global_rel_loss = hidden.new_tensor(0.0)
@@ -824,7 +877,7 @@ def compute_span_loss(model, batch, device, ds_mod, entity_type2id,
                 if 0 <= rel_idx < global_logits.size(-1):
                     global_targets[b_idx, rel_idx] = 1.0
         global_rel_loss = F.binary_cross_entropy_with_logits(global_logits, global_targets)
-    total = ner_loss + re_weight * re_loss + cl_weight * contrastive_loss + bio_weight * bio_loss + global_rel_weight * global_rel_loss
+    total = ner_loss + re_weight * re_loss + cl_weight * contrastive_loss + bio_weight * bio_loss + global_rel_weight * global_rel_loss + re_pair_contrastive_weight * pcl_loss
     if return_bio_logits:
         return total, ner_loss.detach(), re_loss.detach(), contrastive_loss.detach(), bio_loss.detach(), bio_logits
     return total, ner_loss.detach(), re_loss.detach(), contrastive_loss.detach(), bio_loss.detach()
@@ -1383,6 +1436,9 @@ def main():
                 re_comparison_boost=boost_eff,
                 re_no_rel_weight=args.re_no_rel_weight,
                 global_rel_weight=args.global_rel_weight,
+                re_pair_contrastive_weight=args.re_pair_contrastive_weight,
+                re_pair_contrastive_temp=args.re_pair_contrastive_temp,
+                re_pcl_debug=args.re_pcl_debug,
             )
             gold_loss2, _, _, _, _, bio_logits2 = compute_span_loss(
                 model, batch, device, ds_mod, entity_type2id,
@@ -1405,6 +1461,9 @@ def main():
                 re_comparison_boost=boost_eff,
                 re_no_rel_weight=args.re_no_rel_weight,
                 global_rel_weight=args.global_rel_weight,
+                re_pair_contrastive_weight=args.re_pair_contrastive_weight,
+                re_pair_contrastive_temp=args.re_pair_contrastive_temp,
+                re_pcl_debug=args.re_pcl_debug,
             )
             # Average the two losses + symmetric KL on BIO logits
             gold_loss = (gold_loss + gold_loss2) / 2
@@ -1438,6 +1497,9 @@ def main():
                 re_comparison_boost=boost_eff,
                 re_no_rel_weight=args.re_no_rel_weight,
                 global_rel_weight=args.global_rel_weight,
+                re_pair_contrastive_weight=args.re_pair_contrastive_weight,
+                re_pair_contrastive_temp=args.re_pair_contrastive_temp,
+                re_pcl_debug=args.re_pcl_debug,
             )
 
         synth_loss_val = 0.0
