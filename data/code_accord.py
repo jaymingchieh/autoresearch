@@ -505,10 +505,20 @@ def build_doc_dataloaders(tokenizer, data_dir=None, batch_size: int = 1,
     test_examples = _merge(ent_test, rel_test, require_entities=True)
 
     rng = random.Random(seed)
-    rng.shuffle(train_examples)
-    n_dev = int(len(train_examples) * dev_ratio)
-    dev_examples = train_examples[:n_dev]
-    train_examples = train_examples[n_dev:]
+    # B-TW.13: if an explicit dev.csv exists, use it as a fixed (native) dev set
+    # and train on ALL of train.csv. Keeps dev native when train is mixed with
+    # translated silver (else the dev_ratio slice would dilute dev with noise).
+    dev_csv = data_dir / "entities" / "dev.csv"
+    if dev_csv.exists():
+        ent_dev = _load_entities(dev_csv)
+        rel_dev = _load_relations(data_dir / "relations" / "dev.csv", ent_dev)
+        dev_examples = _merge(ent_dev, rel_dev, require_entities=True)
+        rng.shuffle(train_examples)
+    else:
+        rng.shuffle(train_examples)
+        n_dev = int(len(train_examples) * dev_ratio)
+        dev_examples = train_examples[:n_dev]
+        train_examples = train_examples[n_dev:]
 
     def _group_by_doc(examples):
         """Group and sort sentences by doc_id → list of doc groups."""
