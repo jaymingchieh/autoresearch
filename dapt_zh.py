@@ -14,10 +14,12 @@ train_span.py --pretrain-ckpt (same format as cuad_pretrain_xlmr_short.pt).
 from __future__ import annotations
 
 import argparse
+import io
+import json
 import math
 import re
 import unicodedata
-import xml.etree.ElementTree as ET
+import zipfile
 from pathlib import Path
 
 import requests
@@ -28,22 +30,12 @@ from transformers import AutoTokenizer, XLMRobertaForMaskedLM
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-LAW_PCODES = [
-    "D0070016",  # 建築法
-    "D0070113",  # 建築技術規則總則編
-    "D0070115",  # 建築技術規則建築設計施工編
-    "D0070167",  # 建築技術規則建築構造編
-    "D0070168",  # 建築技術規則建築設備編
-    "D0070047",  # 建築師法
-    "D0060001",  # 都市計畫法
-    "D0070093",  # 消防法
-    "D0070099",  # 住宅法
-    "D0060030",  # 區域計畫法
-    "D0070090",  # 建築物室內裝修管理辦法
-    "D0070082",  # 公寓大廈管理條例
-]
+# Bulk ZIP download: https://law.moj.gov.tw/api/Ch/Law/JSON
+# → ChLaw.json with {"Laws": [{"LawName":..., "LawArticles":[{"ArticleContent":...}]}]}
+BULK_JSON_URL = "https://law.moj.gov.tw/api/Ch/Law/JSON"
 
-API_URL = "https://law.moj.gov.tw/api/Laws/GetLawContent.ashx"
+# Filter: law names containing these keywords
+LAW_KEYWORDS = ["建築", "消防", "都市計畫", "住宅", "公寓大廈", "室內裝修", "區域計畫"]
 MODEL_NAME = "xlm-roberta-base"
 MAX_LEN = 256
 BATCH_SIZE = 32
@@ -123,60 +115,41 @@ def _zh_normalize(text: str) -> str:
 
 def _split_sentences(text: str) -> list[str]:
     parts = re.split(r"[。！？；]", text)
-    out = []
-    for p in parts:
-        p = _zh_normalize(p)
-        if len(p) >= MIN_SENT_LEN:
-            out.append(p)
-    return out
-
-
-def fetch_law_articles(pcode: str, session: requests.Session) -> list[str]:
-    """Fetch law articles from law.moj.gov.tw API → list of raw article texts."""
-    resp = session.get(API_URL, params={"pcode": pcode}, timeout=30)
-    resp.raise_for_status()
-
-    articles: list[str] = []
-    try:
-        root = ET.fromstring(resp.content)
-        # Try common tag patterns
-        for tag in ("條文內容", "content", "Content", "text", "Text"):
-            for elem in root.iter(tag):
-                t = (elem.text or "").strip()
-                if t and len(t) >= MIN_SENT_LEN:
-                    articles.append(t)
-        if not articles:
-            # Fallback: collect all text nodes, strip XML tags
-            raw = re.sub(r"<[^>]+>", " ", resp.text)
-            raw = re.sub(r"\s+", "", raw)
-            articles = [raw]
-    except ET.ParseError:
-        # Response might not be XML (e.g. HTML or JSON)
-        raw = re.sub(r"<[^>]+>", " ", resp.text)
-        articles = [raw]
-
-    return articles
+    return [p for p in (_zh_normalize(s) for s in parts) if len(p) >= MIN_SENT_LEN]
 
 
 def prep_data(out_dir: Path, limit: int | None = None) -> Path:
-    """Download TW building laws + sentence-split → out_dir/corpus.txt."""
+    """Download TW building laws (bulk ZIP) → out_dir/corpus.txt.
+
+    Source: law.moj.gov.tw/api/Ch/Law/JSON  (ZIP → ChLaw.json)
+    Filter: law names containing LAW_KEYWORDS
+    Content: LawArticles[*].ArticleContent
+    """
     out_dir.mkdir(parents=True, exist_ok=True)
     corpus_path = out_dir / "corpus.txt"
-    sentences: list[str] = []
-    session = requests.Session()
-    session.headers["User-Agent"] = "Mozilla/5.0 (research)"
 
-    for pcode in LAW_PCODES:
-        print(f"  fetching {pcode} ...", end=" ", flush=True)
-        try:
-            articles = fetch_law_articles(pcode, session)
-            sents = []
-            for art in articles:
-                sents.extend(_split_sentences(art))
-            print(f"{len(sents)} sents")
+    print("  downloading ChLaw.json from law.moj.gov.tw ...", flush=True)
+    resp = requests.get(BULK_JSON_URL, timeout=120)
+    resp.raise_for_status()
+    print(f"  downloaded {len(resp.content)//1024}KB", flush=True)
+
+    z = zipfile.ZipFile(io.BytesIO(resp.content))
+    data = json.loads(z.read("ChLaw.json"))
+    all_laws = data["Laws"]
+
+    sentences: list[str] = []
+    for law in all_laws:
+        name = law.get("LawName", "")
+        if not any(kw in name for kw in LAW_KEYWORDS):
+            continue
+        articles = law.get("LawArticles", [])
+        n = 0
+        for art in articles:
+            content = (art.get("ArticleContent") or "").strip()
+            sents = _split_sentences(content)
             sentences.extend(sents)
-        except Exception as e:
-            print(f"SKIP ({e})")
+            n += len(sents)
+        print(f"  {name}: {len(articles)} articles → {n} sents")
         if limit and len(sentences) >= limit:
             sentences = sentences[:limit]
             break
@@ -263,10 +236,14 @@ def load_start_ckpt(model: XLMRobertaForMaskedLM, ckpt_path: str) -> None:
         print("  no start ckpt — using raw xlm-roberta-base weights")
         return
     sd = torch.load(ckpt_path, map_location="cpu")
-    if "discriminator" in sd:
-        sd = sd["discriminator"]
-    elif "encoder" in sd:
+    if "encoder" in sd:
         sd = sd["encoder"]
+    elif "discriminator" in sd:
+        sd = sd["discriminator"]
+    # CUAD checkpoint keys have "backbone.bert." prefix; strip to match XLMRobertaModel
+    if any(k.startswith("backbone.bert.") for k in sd):
+        sd = {k[len("backbone.bert."):]: v for k, v in sd.items()
+              if k.startswith("backbone.bert.")}
     missing, unexpected = model.roberta.load_state_dict(sd, strict=False)
     print(f"  loaded {ckpt_path}: {len(sd)} keys | missing={len(missing)} unexpected={len(unexpected)}")
 
