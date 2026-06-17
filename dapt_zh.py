@@ -267,7 +267,7 @@ def train_dapt(corpus_path: Path, start_ckpt: str, out_ckpt: Path,
     dataset = CorpusDataset(corpus_path)
     collator = SpanMLMCollator(tokenizer)
     loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True,
-                        collate_fn=collator, drop_last=True)
+                        collate_fn=collator, drop_last=False)
 
     optimizer = torch.optim.AdamW(
         [p for p in model.parameters() if p.requires_grad],
