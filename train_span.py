@@ -100,6 +100,10 @@ def parse_args():
     p.add_argument("--pretrain-ckpt", default="",
                    help="Path to ELECTRA cooperative pre-training checkpoint. "
                         "Loads discriminator backbone weights, reinitializes task heads.")
+    p.add_argument("--load-full-ckpt", action="store_true",
+                   help="With --pretrain-ckpt: restore the full model incl. task heads "
+                        "(skip head reinit). Use to eval/resume a checkpoint saved by "
+                        "--save-best-to on the same dataset/architecture.")
     p.add_argument("--cl-weight", type=float, default=0.0,
                    help="Weight for supervised contrastive (InfoNCE) loss on span embeddings. "
                         "0 = disabled (default). Recommended: 0.05-0.2.")
@@ -1235,12 +1239,14 @@ def main():
             print(f"  Skipping {len(skipped)} shape-mismatched keys: {skipped[:5]}...")
         missing, unexpected = model.load_state_dict(filtered_sd, strict=False)
         # Reinitialize task-specific heads for fresh fine-tuning
-        model.span_ner_head.reset_parameters()
-        model.span_width_emb.reset_parameters()
-        model.span_width_proj.reset_parameters()
-        for m in model.re_head:
-            if hasattr(m, "reset_parameters"):
-                m.reset_parameters()
+        # (skipped with --load-full-ckpt: full restore for eval/resume)
+        if not args.load_full_ckpt:
+            model.span_ner_head.reset_parameters()
+            model.span_width_emb.reset_parameters()
+            model.span_width_proj.reset_parameters()
+            for m in model.re_head:
+                if hasattr(m, "reset_parameters"):
+                    m.reset_parameters()
         print(f"  Loaded pre-trained weights from {args.pretrain_ckpt}")
         print(f"    loaded keys: {len(filtered_sd)}, skipped: {len(skipped)}")
         print(f"    missing: {len(missing)}, unexpected: {len(unexpected)}")
